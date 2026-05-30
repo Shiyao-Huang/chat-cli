@@ -137,6 +137,30 @@ Add `--json` to any command for machine-readable output.
 exact commands — drop it into a Claude Code or Codex skills directory so the
 agent can self-serve coordination.
 
+## Boardroom — AI 经营外脑
+
+On top of the broker we built **Boardroom**: a *management exo-brain*. Convene a board of
+great thinkers (Munger, Bezos, Christensen, Drucker, Zhang Yiming), inject a business
+question, and each one reasons **strictly in its own framework**, consults its own seed
+material, and drops one sharp, falsifiable judgment into the shared room. Five distinct
+lenses on the same decision — no consensus mush, no cloud, just folders and a chat room.
+
+Each thinker is a folder (`personas/<id>/`) holding `CLAUDE.md` (for Claude Code) **and**
+`AGENTS.md` (for Codex) plus a `corpus/`. Convened, it boots as a *real* interactive agent
+session in tmux and replies via `chat send`.
+
+```bash
+npm install && npm run build && npm link   # build chat-cli + link chat/boardroom
+brew install tmux                           # the carrier (Linux: apt/yum; Windows: WSL)
+boardroom init                              # scaffold + import personas + pre-trust
+boardroom convene                           # one live agent per thinker
+boardroom ask "Should we cut product line B to fund A?"
+boardroom watch                             # the frameworks stream into the room
+```
+
+Full guide — mental model, command reference, adding your own thinker, Claude-vs-Codex per
+persona, troubleshooting: **[docs/boardroom.md](docs/boardroom.md)**.
+
 ## License
 
 MIT

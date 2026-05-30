@@ -32,6 +32,7 @@ import {
   copyFileSync,
   appendFileSync,
   writeFileSync,
+  readFileSync,
   readdirSync,
   statSync,
 } from 'node:fs';
@@ -47,11 +48,11 @@ const PRINCIPAL = process.env.BOARD_PRINCIPAL || 'you';
 const CHAT_HOME = process.env.CHAT_HOME || join(homedir(), '.chat-cli', 'rooms');
 const MODEL = process.env.BOARD_MODEL || '';
 const CLAUDE_BIN = process.env.BOARD_CLAUDE_BIN || 'claude';
+const CODEX_BIN = process.env.BOARD_CODEX_BIN || 'codex';
+// Default runtime for personas that don't pin one ("claude" | "codex").
+const DEFAULT_RUNTIME = (process.env.BOARD_RUNTIME || 'claude').toLowerCase();
 // tmux session that holds one window per persona.
 const SESSION = process.env.BOARD_TMUX || 'boardroom';
-// Permission posture for the spawned claude sessions. Personas only need to run
-// the `chat` CLI; bypass keeps them from blocking on prompts in an unattended window.
-const PERMISSION_MODE = process.env.BOARD_PERMISSION_MODE || 'bypassPermissions';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = join(HERE, '..', '..');
@@ -117,22 +118,77 @@ function windowExists(id: string): boolean {
   return out.split('\n').map((s) => s.trim()).includes(id);
 }
 
-// Build the shell command a persona window runs: join the room, then launch claude
-// in the persona folder so it auto-loads CLAUDE.md as its character.
+// Resolve which agent runtime backs a persona. A persona may pin one by writing
+// "claude" or "codex" into <folder>/runtime; otherwise DEFAULT_RUNTIME is used.
+function personaRuntime(id: string): 'claude' | 'codex' {
+  const f = join(personaDir(id), 'runtime');
+  if (existsSync(f)) {
+    const v = readFileSync(f, 'utf8').trim().toLowerCase();
+    if (v === 'codex') return 'codex';
+    if (v === 'claude') return 'claude';
+  }
+  return DEFAULT_RUNTIME === 'codex' ? 'codex' : 'claude';
+}
+
+// Build the shell command a persona window runs: join the room, then exec the agent
+// runtime in the persona folder (so it auto-loads CLAUDE.md / AGENTS.md as character),
+// launched with full bypass so it boots with ZERO confirmation screens.
 function personaCommand(id: string): string {
   const dir = personaDir(id);
+  const runtime = personaRuntime(id);
+  const join0 =
+    `CHAT_HOME=${shq(CHAT_HOME)} chat join --room ${shq(ROOM)} --id ${shq(id)} --role ${shq(id)} --runtime ${shq(runtime)} >/dev/null 2>&1`;
+  if (runtime === 'codex') {
+    const modelFlag = MODEL ? `--model ${shq(MODEL)} ` : '';
+    // codex reads AGENTS.md in cwd; full bypass skips all approval/sandbox prompts.
+    return (
+      `cd ${shq(dir)} && ${join0}; ` +
+      `CHAT_HOME=${shq(CHAT_HOME)} exec ${shq(CODEX_BIN)} ${modelFlag}--dangerously-bypass-approvals-and-sandbox`
+    );
+  }
   const modelFlag = MODEL ? `--model ${shq(MODEL)} ` : '';
-  // chat join is best-effort; then exec claude (interactive, real PTY from tmux).
+  // claude reads CLAUDE.md in cwd; --dangerously-skip-permissions skips the bypass
+  // warning screen, and folders are pre-trusted at init so the trust screen is gone too.
   return (
-    `cd ${shq(dir)} && ` +
-    `CHAT_HOME=${shq(CHAT_HOME)} chat join --room ${shq(ROOM)} --id ${shq(id)} --role ${shq(id)} >/dev/null 2>&1; ` +
-    `CHAT_HOME=${shq(CHAT_HOME)} exec ${shq(CLAUDE_BIN)} ${modelFlag}--permission-mode ${shq(PERMISSION_MODE)}`
+    `cd ${shq(dir)} && ${join0}; ` +
+    `CHAT_HOME=${shq(CHAT_HOME)} exec ${shq(CLAUDE_BIN)} ${modelFlag}--dangerously-skip-permissions`
   );
 }
 
 // POSIX single-quote escaping for embedding in the tmux window command.
 function shq(s: string): string {
   return `'${s.replace(/'/g, `'\\''`)}'`;
+}
+
+// Pre-trust every persona folder in ~/.claude.json so Claude Code launches with no
+// trust dialog. Idempotent and best-effort (never throws). This is what makes
+// `convene` a zero-confirmation, unattended launch for claude-backed personas.
+function pretrustPersonaFolders(ids: string[]): number {
+  const cfgPath = join(homedir(), '.claude.json');
+  let cfg: any = {};
+  if (existsSync(cfgPath)) {
+    try {
+      cfg = JSON.parse(readFileSync(cfgPath, 'utf8'));
+    } catch {
+      return 0; // don't clobber an unparseable config
+    }
+  }
+  cfg.projects = cfg.projects || {};
+  let n = 0;
+  for (const id of ids) {
+    const dir = personaDir(id);
+    const e = cfg.projects[dir] || {};
+    e.hasTrustDialogAccepted = true;
+    e.hasCompletedProjectOnboarding = true;
+    cfg.projects[dir] = e;
+    n++;
+  }
+  try {
+    writeFileSync(cfgPath, JSON.stringify(cfg, null, 2), 'utf8');
+  } catch {
+    return 0;
+  }
+  return n;
 }
 
 // ── persona scaffolding ──────────────────────────────────────────────────────
@@ -172,17 +228,37 @@ function cmdInit(): void {
   } else {
     process.stdout.write(`init: no templates at ${TEMPLATE_DIR} (add: boardroom add <id>).\n`);
   }
+  // Pre-trust all persona folders so Claude Code sessions launch with zero confirmation screens.
+  const trusted = pretrustPersonaFolders(listPersonas());
+  if (trusted) process.stdout.write(`init: pre-trusted ${trusted} persona folder(s) for zero-confirm launch.\n`);
   process.stdout.write(`init: layers ready -> mem/, kb/company/, kb/external/\n`);
 }
 
 function cmdAdd(args: string[]): void {
-  const id = args[0] || die('usage: boardroom add <id> [name]');
-  const name = args[1] || id;
+  // boardroom add <id> [name] [--runtime claude|codex]
+  let runtime = '';
+  const rest: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '--runtime') {
+      runtime = (args[++i] || '').toLowerCase();
+    } else {
+      rest.push(args[i]);
+    }
+  }
+  const id = rest[0] || die('usage: boardroom add <id> [name] [--runtime claude|codex]');
+  const name = rest[1] || id;
   ensureLayers();
   const dir = personaDir(id);
   mkdirSync(join(dir, 'corpus'), { recursive: true });
   const md = join(dir, 'CLAUDE.md');
   if (!existsSync(md)) writeFileSync(md, defaultClaudeMd(id, name), 'utf8');
+  // Dual-runtime: codex reads AGENTS.md. Mirror the persona so a thinker works with either runtime.
+  const agentsMd = join(dir, 'AGENTS.md');
+  if (!existsSync(agentsMd)) writeFileSync(agentsMd, defaultClaudeMd(id, name), 'utf8');
+  if (runtime === 'claude' || runtime === 'codex') {
+    writeFileSync(join(dir, 'runtime'), runtime + '\n', 'utf8');
+  }
+  pretrustPersonaFolders([id]);
   process.stdout.write(`persona '${id}' ready at ${dir} (fill corpus/ with material).\n`);
 }
 
@@ -268,6 +344,8 @@ function cmdConvene(args: string[]): void {
   }
   const ids = args.length ? args : listPersonas();
   if (!ids.length) die('no personas (run: boardroom init, or boardroom add <id>)');
+  // Ensure zero-confirm launch for any claude-backed personas being convened.
+  pretrustPersonaFolders(ids);
 
   if (!sessionExists()) {
     // Create the session detached with the first persona in window 0.
@@ -352,7 +430,10 @@ function cmdAskOne(args: string[]): void {
 function cmdStatus(): void {
   const inSession = sessionExists();
   process.stdout.write(`session: ${inSession ? `in session (tmux '${SESSION}')` : 'idle'}\n`);
-  process.stdout.write(`personas (folders): ${listPersonas().join(', ') || '(none)'}\n`);
+  const personas = listPersonas();
+  process.stdout.write(
+    `personas (folders): ${personas.map((id) => `${id}[${personaRuntime(id)}]`).join(', ') || '(none)'}\n`,
+  );
   if (inSession) {
     const { out } = tmux(['list-windows', '-t', SESSION, '-F', '#{window_name}']);
     process.stdout.write(`live windows: ${out.split('\n').map((s) => s.trim()).filter(Boolean).join(', ')}\n`);
@@ -378,32 +459,46 @@ function cmdAdjourn(): void {
   process.stdout.write('adjourned (folders persist).\n');
 }
 
+function cmdRuntime(args: string[]): void {
+  const id = args[0] || die('usage: boardroom runtime <id> [claude|codex]');
+  if (!existsSync(personaDir(id))) die(`unknown persona: ${id}`);
+  const val = (args[1] || '').toLowerCase();
+  if (!val) {
+    process.stdout.write(`${id}: ${personaRuntime(id)}\n`);
+    return;
+  }
+  if (val !== 'claude' && val !== 'codex') die('runtime must be claude or codex');
+  writeFileSync(join(personaDir(id), 'runtime'), val + '\n', 'utf8');
+  process.stdout.write(`${id} runtime set to ${val}\n`);
+}
+
 function usage(): void {
-  process.stdout.write(`boardroom — AI 经营外脑 on chat-cli (live claude per thinker, carried by tmux)
+  process.stdout.write(`boardroom — AI 经营外脑 on chat-cli (a live agent per thinker, carried by tmux)
 
 Setup / roster (everything is just folders):
-  boardroom init                    Scaffold $BOARD_HOME and import persona templates.
-  boardroom add <id> [name]         Create an empty persona folder (CLAUDE.md + corpus/).
+  boardroom init                    Scaffold $BOARD_HOME, import personas, pre-trust for zero-confirm launch.
+  boardroom add <id> [name] [--runtime claude|codex]   Create a persona folder (CLAUDE.md + AGENTS.md + corpus/).
   boardroom seed <id> <file>        Append a file into persona <id>'s corpus.
+  boardroom runtime <id> [claude|codex]   Show or set which agent runtime backs a persona.
   boardroom list                    List personas (folders).
 
 Your layers (also folders):
   boardroom remember <text>         Append a note to YOUR long-term memory (mem/).
   boardroom doc <file> [company|external]   Import a doc into the fact layer (kb/).
 
-Run the board (each persona = a live claude in a tmux window; topic via send-keys):
-  boardroom convene [ids...]        Open one live persona window per id (default: all).
+Run the board (each persona = a live claude/codex in a tmux window; topic via send-keys):
+  boardroom convene [ids...]        Open one live persona window per id (default: all). Zero confirmation screens.
   boardroom ask "<topic>"           send-keys a topic into every live persona; they reply into the room.
   boardroom ask-one <id> "<topic>"  Ask a single thinker.
   boardroom watch                   Tail the boardroom room live.
   boardroom minutes [N]             Print the last N messages as meeting minutes.
   boardroom digest                  Append the current minutes into YOUR memory (mem/).
   boardroom attach                  Attach to the tmux session (Ctrl-b d to detach).
-  boardroom status                  Show session + live windows.
+  boardroom status                  Show session + live windows + each persona's runtime.
   boardroom adjourn                 Kill the tmux session (folders persist).
 
-Env: BOARD_HOME, BOARD_ROOM, BOARD_PRINCIPAL, BOARD_MODEL, BOARD_CLAUDE_BIN,
-     BOARD_TMUX (session name), BOARD_PERMISSION_MODE, CHAT_HOME.
+Env: BOARD_HOME, BOARD_ROOM, BOARD_PRINCIPAL, BOARD_MODEL, BOARD_RUNTIME (claude|codex),
+     BOARD_CLAUDE_BIN, BOARD_CODEX_BIN, BOARD_TMUX (session name), CHAT_HOME.
 `);
 }
 
@@ -413,6 +508,7 @@ function main(): void {
     case 'init': return cmdInit();
     case 'add': return cmdAdd(args);
     case 'seed': return cmdSeed(args);
+    case 'runtime': return cmdRuntime(args);
     case 'list': process.stdout.write(listPersonas().join('\n') + '\n'); return;
     case 'remember': return cmdRemember(args);
     case 'doc': return cmdDoc(args);
