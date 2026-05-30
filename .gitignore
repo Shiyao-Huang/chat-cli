@@ -1,0 +1,12 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+*.tsbuildinfo
+
+# Local broker state (default CHAT_HOME when run from the repo)
+.chat-cli/
+
+# Session scratch
+.claude/
