@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Cross-platform boardroom entry (Mac/Linux/Windows). No bash, no tmux.
+// boardroom entry. Live claude per thinker, carried by tmux (Mac/Linux; Windows via WSL).
 import('../dist/boardroom/boardroom.js').catch((err) => {
   console.error(err?.stack || String(err));
   process.exit(1);

@@ -1,9 +1,14 @@
 /**
  * boardroom — an "AI 经营外脑" (management exo-brain) built entirely on chat-cli.
  *
- * CROSS-PLATFORM by design (Mac / Linux / Windows): no bash, no tmux. Each thinker's
- * "brain" is a live `claude` process spawned via Node child_process; a topic is
- * "injected" by writing to that process's stdin. The same mechanism works on every OS.
+ * Each thinker's "brain" is a LIVE interactive `claude` session. The carrier is
+ * tmux: every persona runs in its own tmux window (which gives claude a real PTY),
+ * and a topic is "injected" with `tmux send-keys`. This reuses the mechanism proven
+ * in happy-cli (spawnInTmux + send-keys), reimplemented here as a thin, dependency-
+ * free wrapper over the tmux CLI. (No `claude -p`: these are real interactive sessions.)
+ *
+ * tmux is Mac/Linux. On Windows, use it under WSL (a Windows-native carrier can be
+ * added later); `convene` detects a missing tmux and says so.
  *
  * Mental model — everything is just folders + a chat room (no Mem0/RAGFlow/Dify):
  *
@@ -11,17 +16,13 @@
  *     personas/<id>/CLAUDE.md        a thinker's PERSONA (claude auto-loads it as character)
  *     personas/<id>/corpus/*.md      that thinker's MEMORY (views / methods / interviews)
  *     mem/                           YOUR long-term memory & judgment preferences
- *     kb/company/  kb/external/       the fact layer (meeting docs, business progress, outside material)
+ *     kb/company/  kb/external/       the fact layer (meeting docs, business progress)
  *
  *   The chat room "boardroom" (chat-cli broker under $CHAT_HOME) is the live meeting.
- *   convene -> spawn one live claude per persona (cwd = its folder, joined as that member).
- *   ask "<topic>" -> write the topic to every persona process's stdin.
+ *   convene -> one tmux window per persona, each running `claude` in its folder, joined as that member.
+ *   ask "<topic>" -> tmux send-keys the topic into every persona window.
  *   each persona thinks in ITS framework, consults ./corpus, runs `chat send` into the room.
  *   you -> `boardroom watch` to see every framework's input stream in.
- *
- * A daemon (the spawned processes) must outlive a single CLI call, so `convene` detaches
- * a small supervisor that owns the child processes and listens on a control pipe for
- * inject/adjourn commands. State lives in $BOARD_HOME/.runtime/.
  */
 
 import {
@@ -31,18 +32,13 @@ import {
   copyFileSync,
   appendFileSync,
   writeFileSync,
-  readFileSync,
   readdirSync,
   statSync,
-  rmSync,
 } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, basename, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { spawn } from 'node:child_process';
-import { execFileSync } from 'node:child_process';
-import net from 'node:net';
-import { openSync } from 'node:fs';
+import { execFileSync, spawnSync } from 'node:child_process';
 
 // ── Config from env ──────────────────────────────────────────────────────────
 const BOARD_HOME = process.env.BOARD_HOME || join(homedir(), '.chat-cli', 'boardroom');
@@ -51,17 +47,13 @@ const PRINCIPAL = process.env.BOARD_PRINCIPAL || 'you';
 const CHAT_HOME = process.env.CHAT_HOME || join(homedir(), '.chat-cli', 'rooms');
 const MODEL = process.env.BOARD_MODEL || '';
 const CLAUDE_BIN = process.env.BOARD_CLAUDE_BIN || 'claude';
-
-const RUNTIME_DIR = join(BOARD_HOME, '.runtime');
-const SOCK_PATH =
-  process.platform === 'win32'
-    ? '\\\\.\\pipe\\boardroom-' + Buffer.from(BOARD_HOME).toString('hex').slice(0, 16)
-    : join(RUNTIME_DIR, 'control.sock');
-const PID_PATH = join(RUNTIME_DIR, 'supervisor.pid');
-const LOG_PATH = join(RUNTIME_DIR, 'supervisor.log');
+// tmux session that holds one window per persona.
+const SESSION = process.env.BOARD_TMUX || 'boardroom';
+// Permission posture for the spawned claude sessions. Personas only need to run
+// the `chat` CLI; bypass keeps them from blocking on prompts in an unattended window.
+const PERMISSION_MODE = process.env.BOARD_PERMISSION_MODE || 'bypassPermissions';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-// dist/boardroom/boardroom.js -> repo root is two up; templates ship alongside.
 const REPO_ROOT = join(HERE, '..', '..');
 const TEMPLATE_DIR = join(REPO_ROOT, 'templates', 'personas');
 
@@ -71,7 +63,6 @@ function ensureLayers(): void {
     join(BOARD_HOME, 'mem'),
     join(BOARD_HOME, 'kb', 'company'),
     join(BOARD_HOME, 'kb', 'external'),
-    RUNTIME_DIR,
   ]) {
     if (!existsSync(d)) mkdirSync(d, { recursive: true });
   }
@@ -98,6 +89,50 @@ function listPersonas(): string[] {
 function die(msg: string): never {
   process.stderr.write(`boardroom: ${msg}\n`);
   process.exit(1);
+}
+
+// ── tmux helpers (thin, dependency-free; command sequence per happy's tmux.ts) ──
+
+function tmux(args: string[], capture = true): { ok: boolean; out: string } {
+  const res = spawnSync('tmux', args, { encoding: 'utf8' });
+  return { ok: res.status === 0, out: (res.stdout || '') + (res.stderr || '') };
+}
+
+function tmuxAvailable(): boolean {
+  const res = spawnSync('tmux', ['-V'], { encoding: 'utf8' });
+  return res.status === 0;
+}
+
+function sessionExists(): boolean {
+  return tmux(['has-session', '-t', SESSION]).ok;
+}
+
+function windowFor(id: string): string {
+  return `${SESSION}:${id}`;
+}
+
+function windowExists(id: string): boolean {
+  const { ok, out } = tmux(['list-windows', '-t', SESSION, '-F', '#{window_name}']);
+  if (!ok) return false;
+  return out.split('\n').map((s) => s.trim()).includes(id);
+}
+
+// Build the shell command a persona window runs: join the room, then launch claude
+// in the persona folder so it auto-loads CLAUDE.md as its character.
+function personaCommand(id: string): string {
+  const dir = personaDir(id);
+  const modelFlag = MODEL ? `--model ${shq(MODEL)} ` : '';
+  // chat join is best-effort; then exec claude (interactive, real PTY from tmux).
+  return (
+    `cd ${shq(dir)} && ` +
+    `CHAT_HOME=${shq(CHAT_HOME)} chat join --room ${shq(ROOM)} --id ${shq(id)} --role ${shq(id)} >/dev/null 2>&1; ` +
+    `CHAT_HOME=${shq(CHAT_HOME)} exec ${shq(CLAUDE_BIN)} ${modelFlag}--permission-mode ${shq(PERMISSION_MODE)}`
+  );
+}
+
+// POSIX single-quote escaping for embedding in the tmux window command.
+function shq(s: string): string {
+  return `'${s.replace(/'/g, `'\\''`)}'`;
 }
 
 // ── persona scaffolding ──────────────────────────────────────────────────────
@@ -181,288 +216,170 @@ function cmdDoc(args: string[]): void {
   process.stdout.write(`imported ${basename(file)} -> kb/${kind}/\n`);
 }
 
-// ── chat helpers (shell out to the installed `chat` CLI) ──────────────────────
+// ── chat passthrough (for watch / minutes / digest) ───────────────────────────
 
-function chat(args: string[], opts: { capture?: boolean } = {}): string {
-  const env = { ...process.env, CHAT_HOME };
-  const res = spawnSyncSafe('chat', args, env, opts.capture);
-  return res;
-}
-
-function spawnSyncSafe(cmd: string, args: string[], env: NodeJS.ProcessEnv, capture?: boolean): string {
+function chatCapture(args: string[]): string {
   try {
-    const out = execFileSync(cmd, args, {
-      env,
+    return execFileSync('chat', args, {
+      env: { ...process.env, CHAT_HOME },
       encoding: 'utf8',
-      stdio: capture ? ['ignore', 'pipe', 'pipe'] : ['ignore', 'inherit', 'inherit'],
-      shell: process.platform === 'win32', // resolve .cmd shims on Windows
-    });
-    return out ? out.toString() : '';
-  } catch (e: any) {
-    if (capture) return '';
-    throw e;
+      shell: process.platform === 'win32',
+    }).toString();
+  } catch {
+    return '';
   }
 }
 
 function cmdWatch(): void {
-  // Long-running tail; replace this process with `chat watch` semantics via inherit.
-  chat(['watch', '--room', ROOM, '--id', PRINCIPAL]);
+  try {
+    execFileSync('chat', ['watch', '--room', ROOM, '--id', PRINCIPAL], {
+      env: { ...process.env, CHAT_HOME },
+      stdio: 'inherit',
+      shell: process.platform === 'win32',
+    });
+  } catch {
+    /* user Ctrl-C */
+  }
 }
 
 function cmdMinutes(args: string[]): void {
-  const n = args[0] || '40';
-  process.stdout.write(chat(['history', '--room', ROOM, '--limit', n], { capture: true }));
+  process.stdout.write(chatCapture(['history', '--room', ROOM, '--limit', args[0] || '40']));
 }
 
 function cmdDigest(args: string[]): void {
-  const n = args[0] || '60';
   ensureLayers();
   const f = join(BOARD_HOME, 'mem', 'minutes.md');
-  const body = chat(['history', '--room', ROOM, '--limit', n], { capture: true });
+  const body = chatCapture(['history', '--room', ROOM, '--limit', args[0] || '60']);
   appendFileSync(f, `\n## Boardroom session digest\n${body}\n`, 'utf8');
   process.stdout.write(`digest appended -> ${f}\n`);
 }
 
-// ── supervisor (daemon) — owns the live persona processes ─────────────────────
-
-interface Child {
-  id: string;
-  proc: import('node:child_process').ChildProcess;
-}
-
-function runSupervisor(ids: string[]): void {
-  ensureLayers();
-  const log = (m: string) => appendFileSync(LOG_PATH, `[${new Date().toISOString()}] ${m}\n`, 'utf8');
-  writeFileSync(PID_PATH, String(process.pid), 'utf8');
-  const children: Child[] = [];
-
-  for (const id of ids) {
-    const dir = personaDir(id);
-    if (!existsSync(dir)) {
-      log(`skip ${id}: no folder`);
-      continue;
-    }
-    // Pre-join the room so the roster shows the member even before first reply.
-    spawnSyncSafe('chat', ['join', '--room', ROOM, '--id', id, '--role', id], { ...process.env, CHAT_HOME }, true);
-    const claudeArgs = MODEL ? ['--model', MODEL] : [];
-    const proc = spawn(CLAUDE_BIN, claudeArgs, {
-      cwd: dir,
-      env: { ...process.env, CHAT_HOME },
-      stdio: ['pipe', 'pipe', 'pipe'],
-      shell: process.platform === 'win32',
-    });
-    proc.stdout.on('data', (d) => log(`[${id}] ${d.toString().trim()}`));
-    proc.stderr.on('data', (d) => log(`[${id}!] ${d.toString().trim()}`));
-    proc.on('exit', (code) => log(`[${id}] exited code=${code}`));
-    children.push({ id, proc });
-    log(`spawned ${id} (pid ${proc.pid})`);
-  }
-
-  const inject = (id: string, text: string): boolean => {
-    const c = children.find((x) => x.id === id);
-    if (!c || !c.proc.stdin || c.proc.exitCode !== null) return false;
-    c.proc.stdin.write(text.endsWith('\n') ? text : text + '\n');
-    return true;
-  };
-
-  const server = net.createServer((sock) => {
-    let buf = '';
-    sock.on('data', (d) => {
-      buf += d.toString();
-      let idx: number;
-      while ((idx = buf.indexOf('\n')) >= 0) {
-        const line = buf.slice(0, idx);
-        buf = buf.slice(idx + 1);
-        if (!line.trim()) continue;
-        let msg: any;
-        try {
-          msg = JSON.parse(line);
-        } catch {
-          continue;
-        }
-        if (msg.cmd === 'inject') {
-          const targets = msg.id === '*' ? children.map((c) => c.id) : [msg.id];
-          const done = targets.map((t: string) => ({ id: t, ok: inject(t, msg.text) }));
-          sock.write(JSON.stringify({ ok: true, done }) + '\n');
-        } else if (msg.cmd === 'list') {
-          sock.write(JSON.stringify({ ok: true, ids: children.map((c) => c.id) }) + '\n');
-        } else if (msg.cmd === 'adjourn') {
-          sock.write(JSON.stringify({ ok: true }) + '\n');
-          shutdown();
-        } else {
-          sock.write(JSON.stringify({ ok: false, error: 'unknown cmd' }) + '\n');
-        }
-      }
-    });
-  });
-
-  function shutdown(): void {
-    log('adjourning');
-    for (const c of children) {
-      try {
-        c.proc.stdin?.end();
-        c.proc.kill();
-      } catch {
-        /* ignore */
-      }
-      try {
-        spawnSyncSafe('chat', ['leave', '--room', ROOM, '--id', c.id], { ...process.env, CHAT_HOME }, true);
-      } catch {
-        /* ignore */
-      }
-    }
-    try {
-      server.close();
-    } catch {
-      /* ignore */
-    }
-    for (const p of [PID_PATH, process.platform === 'win32' ? '' : SOCK_PATH].filter(Boolean)) {
-      try {
-        rmSync(p);
-      } catch {
-        /* ignore */
-      }
-    }
-    process.exit(0);
-  }
-
-  if (process.platform !== 'win32' && existsSync(SOCK_PATH)) {
-    try {
-      rmSync(SOCK_PATH);
-    } catch {
-      /* ignore */
-    }
-  }
-  server.listen(SOCK_PATH, () => log(`supervisor listening on ${SOCK_PATH} with ${children.length} personas`));
-  process.on('SIGTERM', shutdown);
-  process.on('SIGINT', shutdown);
-}
-
-// ── control client (CLI -> supervisor over the pipe) ──────────────────────────
-
-function controlSend(msg: object, timeoutMs = 4000): Promise<any> {
-  return new Promise((resolve, reject) => {
-    const sock = net.createConnection(SOCK_PATH);
-    let buf = '';
-    const timer = setTimeout(() => {
-      sock.destroy();
-      reject(new Error('control timeout (is the boardroom convened?)'));
-    }, timeoutMs);
-    sock.on('connect', () => sock.write(JSON.stringify(msg) + '\n'));
-    sock.on('data', (d) => {
-      buf += d.toString();
-      const idx = buf.indexOf('\n');
-      if (idx >= 0) {
-        clearTimeout(timer);
-        try {
-          resolve(JSON.parse(buf.slice(0, idx)));
-        } catch (e) {
-          reject(e as Error);
-        }
-        sock.end();
-      }
-    });
-    sock.on('error', (e) => {
-      clearTimeout(timer);
-      reject(e);
-    });
-  });
-}
-
-function supervisorAlive(): boolean {
-  if (!existsSync(PID_PATH)) return false;
-  const pid = Number(readFileSync(PID_PATH, 'utf8').trim());
-  if (!pid) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
-}
+// ── convene / ask / adjourn (tmux carrier) ────────────────────────────────────
 
 function cmdConvene(args: string[]): void {
   ensureLayers();
+  if (!tmuxAvailable()) {
+    die(
+      'tmux not found. The boardroom carries live claude sessions in tmux windows.\n' +
+        '  macOS:  brew install tmux\n' +
+        '  Linux:  apt/yum install tmux\n' +
+        '  Windows: run boardroom inside WSL (a native carrier can be added later).',
+    );
+  }
   const ids = args.length ? args : listPersonas();
   if (!ids.length) die('no personas (run: boardroom init, or boardroom add <id>)');
-  if (supervisorAlive()) {
-    process.stdout.write(`convene: already in session. (boardroom adjourn to reset)\n`);
-    return;
+
+  if (!sessionExists()) {
+    // Create the session detached with the first persona in window 0.
+    const first = ids[0];
+    const r = tmux([
+      'new-session', '-d', '-s', SESSION, '-n', first, '-c', personaDir(first),
+    ]);
+    if (!r.ok) die(`failed to create tmux session: ${r.out}`);
+    tmux(['send-keys', '-t', windowFor(first), personaCommand(first), 'C-m']);
+    process.stdout.write(`convened: ${first}\n`);
+    for (const id of ids.slice(1)) convenePersona(id);
+  } else {
+    for (const id of ids) convenePersona(id);
   }
-  // Spawn a DETACHED supervisor running this same script with the hidden __supervise verb.
-  const selfArgs = [process.argv[1], '__supervise', ...ids];
-  const out = openSync(LOG_PATH, 'a');
-  const sup = spawn(process.execPath, selfArgs, {
-    detached: true,
-    stdio: ['ignore', out, out],
-    env: process.env,
-  });
-  sup.unref();
-  process.stdout.write(`convened ${ids.length} thinker(s): ${ids.join(', ')}\n`);
-  process.stdout.write(`Live claude sessions are booting. In a few seconds:\n`);
-  process.stdout.write(`  boardroom ask "<your topic>"   # inject a topic to every thinker\n`);
-  process.stdout.write(`  boardroom watch                # see their inputs stream into the room\n`);
+
+  process.stdout.write(
+    `Boardroom in session (tmux '${SESSION}'). Live claude sessions are booting.\n` +
+      `  boardroom ask "<your topic>"   # send-keys a topic to every thinker\n` +
+      `  boardroom watch                # see their inputs stream into the room\n` +
+      `  boardroom attach               # watch the thinkers think (Ctrl-b d to detach)\n`,
+  );
 }
 
-async function cmdAsk(args: string[]): Promise<void> {
+function convenePersona(id: string): void {
+  if (!existsSync(personaDir(id))) {
+    process.stdout.write(`  skip ${id}: no folder\n`);
+    return;
+  }
+  if (windowExists(id)) {
+    process.stdout.write(`  ${id}: already convened\n`);
+    return;
+  }
+  const r = tmux(['new-window', '-t', SESSION, '-n', id, '-c', personaDir(id)]);
+  if (!r.ok) {
+    process.stdout.write(`  ${id}: failed (${r.out.trim()})\n`);
+    return;
+  }
+  tmux(['send-keys', '-t', windowFor(id), personaCommand(id), 'C-m']);
+  process.stdout.write(`convened: ${id}\n`);
+}
+
+function injectTopic(id: string, text: string): boolean {
+  if (!windowExists(id)) return false;
+  // happy's lesson: send the text and the Enter key as SEPARATE send-keys calls.
+  const a = tmux(['send-keys', '-t', windowFor(id), '-l', text]); // -l: literal, no key-name parsing
+  const b = tmux(['send-keys', '-t', windowFor(id), 'C-m']);
+  return a.ok && b.ok;
+}
+
+function askPrompt(id: string, topic: string): string {
+  return (
+    `[BOARDROOM 议题] ${topic} ` +
+    `（只用你自己的框架，参考 ./corpus/，给一条最高杠杆输入 + 一个可证伪判断，` +
+    `然后运行：chat send --room ${ROOM} --from ${id} --to ${PRINCIPAL} --type notification "..."）`
+  );
+}
+
+function cmdAsk(args: string[]): void {
   const topic = args.join(' ').trim();
   if (!topic) die('usage: boardroom ask "<topic>"');
-  if (!supervisorAlive()) die('no session — run: boardroom convene');
+  if (!sessionExists()) die('no session — run: boardroom convene');
   // Record the principal's question into the room so minutes are complete.
-  chat(['send', '--room', ROOM, '--from', PRINCIPAL, '--message', `议题: ${topic}`], { capture: true });
-  const prompt =
-    `[BOARDROOM 议题] ${topic}\n` +
-    `请只用你自己的框架思考，参考 ./corpus/，给出一条最高杠杆输入 + 一个可证伪判断，` +
-    `然后运行：chat send --room ${ROOM} --from <你的id> --to ${PRINCIPAL} --type notification "..."`;
-  const res = await controlSend({ cmd: 'inject', id: '*', text: prompt });
-  const oks = (res.done || []).filter((d: any) => d.ok).map((d: any) => d.id);
-  process.stdout.write(`asked: ${oks.join(', ') || '(none)'}\n`);
+  chatCapture(['send', '--room', ROOM, '--from', PRINCIPAL, '--message', `议题: ${topic}`]);
+  const targets = listPersonas().filter(windowExists);
+  const asked: string[] = [];
+  for (const id of targets) {
+    if (injectTopic(id, askPrompt(id, topic))) asked.push(id);
+  }
+  process.stdout.write(`asked: ${asked.join(', ') || '(none live)'}\n`);
   process.stdout.write(`Watch replies:  boardroom watch\n`);
 }
 
-async function cmdAskOne(args: string[]): Promise<void> {
+function cmdAskOne(args: string[]): void {
   const id = args[0] || die('usage: boardroom ask-one <id> "<topic>"');
   const topic = args.slice(1).join(' ').trim();
   if (!topic) die('need a topic');
-  if (!supervisorAlive()) die('no session — run: boardroom convene');
-  const prompt =
-    `[BOARDROOM 议题] ${topic}\n` +
-    `只用你的框架，参考 ./corpus/，给一条最高杠杆输入 + 一个可证伪判断，` +
-    `然后运行：chat send --room ${ROOM} --from ${id} --to ${PRINCIPAL} --type notification "..."`;
-  const res = await controlSend({ cmd: 'inject', id, text: prompt });
-  const ok = (res.done || []).some((d: any) => d.ok);
-  process.stdout.write(ok ? `asked ${id}. Watch: boardroom watch\n` : `failed to reach ${id} (is it live?)\n`);
+  if (!sessionExists()) die('no session — run: boardroom convene');
+  const ok = injectTopic(id, askPrompt(id, topic));
+  process.stdout.write(ok ? `asked ${id}. Watch: boardroom watch\n` : `failed to reach ${id} (is it convened?)\n`);
 }
 
-async function cmdAdjourn(): Promise<void> {
-  if (!supervisorAlive()) {
+function cmdStatus(): void {
+  const inSession = sessionExists();
+  process.stdout.write(`session: ${inSession ? `in session (tmux '${SESSION}')` : 'idle'}\n`);
+  process.stdout.write(`personas (folders): ${listPersonas().join(', ') || '(none)'}\n`);
+  if (inSession) {
+    const { out } = tmux(['list-windows', '-t', SESSION, '-F', '#{window_name}']);
+    process.stdout.write(`live windows: ${out.split('\n').map((s) => s.trim()).filter(Boolean).join(', ')}\n`);
+  }
+}
+
+function cmdAttach(): void {
+  if (!sessionExists()) die('no session — run: boardroom convene');
+  // Replace this process with an attached tmux client.
+  const res = spawnSync('tmux', ['attach', '-t', SESSION], { stdio: 'inherit' });
+  process.exit(res.status ?? 0);
+}
+
+function cmdAdjourn(): void {
+  if (!sessionExists()) {
     process.stdout.write('no active session.\n');
     return;
   }
-  try {
-    await controlSend({ cmd: 'adjourn' });
-  } catch {
-    /* supervisor may exit before replying */
+  for (const id of listPersonas()) {
+    if (windowExists(id)) chatCapture(['leave', '--room', ROOM, '--id', id]);
   }
+  tmux(['kill-session', '-t', SESSION]);
   process.stdout.write('adjourned (folders persist).\n');
 }
 
-async function cmdStatus(): Promise<void> {
-  const alive = supervisorAlive();
-  process.stdout.write(`session: ${alive ? 'in session' : 'idle'}\n`);
-  process.stdout.write(`personas (folders): ${listPersonas().join(', ') || '(none)'}\n`);
-  if (alive) {
-    try {
-      const res = await controlSend({ cmd: 'list' });
-      process.stdout.write(`live thinkers: ${(res.ids || []).join(', ')}\n`);
-    } catch {
-      /* ignore */
-    }
-  }
-}
-
 function usage(): void {
-  process.stdout.write(`boardroom — AI 经营外脑 on chat-cli (cross-platform: Mac/Linux/Windows)
+  process.stdout.write(`boardroom — AI 经营外脑 on chat-cli (live claude per thinker, carried by tmux)
 
 Setup / roster (everything is just folders):
   boardroom init                    Scaffold $BOARD_HOME and import persona templates.
@@ -474,66 +391,43 @@ Your layers (also folders):
   boardroom remember <text>         Append a note to YOUR long-term memory (mem/).
   boardroom doc <file> [company|external]   Import a doc into the fact layer (kb/).
 
-Run the board (each persona = a live claude process; topic injected via stdin):
-  boardroom convene [ids...]        Spawn one live persona process per id (default: all).
-  boardroom ask "<topic>"           Inject a topic into every live persona; they reply into the room.
+Run the board (each persona = a live claude in a tmux window; topic via send-keys):
+  boardroom convene [ids...]        Open one live persona window per id (default: all).
+  boardroom ask "<topic>"           send-keys a topic into every live persona; they reply into the room.
   boardroom ask-one <id> "<topic>"  Ask a single thinker.
   boardroom watch                   Tail the boardroom room live.
   boardroom minutes [N]             Print the last N messages as meeting minutes.
   boardroom digest                  Append the current minutes into YOUR memory (mem/).
-  boardroom status                  Show session + live thinkers.
-  boardroom adjourn                 Stop all persona processes (folders persist).
+  boardroom attach                  Attach to the tmux session (Ctrl-b d to detach).
+  boardroom status                  Show session + live windows.
+  boardroom adjourn                 Kill the tmux session (folders persist).
 
-Env: BOARD_HOME, BOARD_ROOM, BOARD_PRINCIPAL, BOARD_MODEL, BOARD_CLAUDE_BIN, CHAT_HOME.
+Env: BOARD_HOME, BOARD_ROOM, BOARD_PRINCIPAL, BOARD_MODEL, BOARD_CLAUDE_BIN,
+     BOARD_TMUX (session name), BOARD_PERMISSION_MODE, CHAT_HOME.
 `);
 }
 
-async function main(): Promise<void> {
+function main(): void {
   const [cmd, ...args] = process.argv.slice(2);
   switch (cmd) {
-    case '__supervise':
-      return runSupervisor(args);
-    case 'init':
-      return cmdInit();
-    case 'add':
-      return cmdAdd(args);
-    case 'seed':
-      return cmdSeed(args);
-    case 'list':
-      process.stdout.write(listPersonas().join('\n') + '\n');
-      return;
-    case 'remember':
-      return cmdRemember(args);
-    case 'doc':
-      return cmdDoc(args);
-    case 'convene':
-      return cmdConvene(args);
-    case 'ask':
-      return cmdAsk(args);
-    case 'ask-one':
-      return cmdAskOne(args);
-    case 'watch':
-      return cmdWatch();
-    case 'minutes':
-      return cmdMinutes(args);
-    case 'digest':
-      return cmdDigest(args);
-    case 'status':
-      return cmdStatus();
-    case 'adjourn':
-      return cmdAdjourn();
-    case 'help':
-    case '-h':
-    case '--help':
-    case undefined:
-      return usage();
-    default:
-      usage();
-      process.exit(1);
+    case 'init': return cmdInit();
+    case 'add': return cmdAdd(args);
+    case 'seed': return cmdSeed(args);
+    case 'list': process.stdout.write(listPersonas().join('\n') + '\n'); return;
+    case 'remember': return cmdRemember(args);
+    case 'doc': return cmdDoc(args);
+    case 'convene': return cmdConvene(args);
+    case 'ask': return cmdAsk(args);
+    case 'ask-one': return cmdAskOne(args);
+    case 'watch': return cmdWatch();
+    case 'minutes': return cmdMinutes(args);
+    case 'digest': return cmdDigest(args);
+    case 'status': return cmdStatus();
+    case 'attach': return cmdAttach();
+    case 'adjourn': return cmdAdjourn();
+    case 'help': case '-h': case '--help': case undefined: return usage();
+    default: usage(); process.exit(1);
   }
 }
 
-main().catch((e) => {
-  process.stderr.write(`boardroom: ${e?.message || String(e)}\n`);
-  process.exit(1);
-});
+main();
