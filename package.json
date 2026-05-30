@@ -5,7 +5,8 @@
   "type": "module",
   "bin": {
     "chat": "bin/chat.js",
-    "chat-mcp": "bin/chat-mcp.js"
+    "chat-mcp": "bin/chat-mcp.js",
+    "boardroom": "bin/boardroom.js"
   },
   "exports": {
     ".": "./dist/core/index.js"
@@ -13,6 +14,7 @@
   "files": [
     "dist",
     "bin",
+    "templates",
     "skills"
   ],
   "scripts": {
