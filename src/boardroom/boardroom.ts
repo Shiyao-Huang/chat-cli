@@ -191,6 +191,48 @@ function pretrustPersonaFolders(ids: string[]): number {
   return n;
 }
 
+// Pre-trust codex-backed persona folders in ~/.codex/config.toml so Codex launches
+// with no "trust this directory?" prompt. Codex records trust as a TOML table:
+//   [projects."<abs path>"]
+//   trust_level = "trusted"
+// Idempotent: skips any folder already present. Best-effort (never throws).
+function pretrustCodexFolders(ids: string[]): number {
+  const cfgPath = join(homedir(), '.codex', 'config.toml');
+  let body = '';
+  if (existsSync(cfgPath)) {
+    try {
+      body = readFileSync(cfgPath, 'utf8');
+    } catch {
+      return 0;
+    }
+  }
+  let added = 0;
+  let append = '';
+  for (const id of ids) {
+    if (personaRuntime(id) !== 'codex') continue;
+    const dir = personaDir(id);
+    // Match the exact table header codex writes.
+    const header = `[projects."${dir}"]`;
+    if (body.includes(header) || append.includes(header)) continue;
+    append += `\n${header}\ntrust_level = "trusted"\n`;
+    added++;
+  }
+  if (!append) return 0;
+  try {
+    writeFileSync(cfgPath, body + append, 'utf8');
+  } catch {
+    return 0;
+  }
+  return added;
+}
+
+// Pre-trust all personas for their respective runtimes so convene is zero-confirm.
+function pretrustAll(ids: string[]): void {
+  pretrustPersonaFolders(ids); // claude (~/.claude.json)
+  pretrustCodexFolders(ids); // codex (~/.codex/config.toml)
+}
+
+
 // ── persona scaffolding ──────────────────────────────────────────────────────
 
 function defaultClaudeMd(id: string, name: string): string {
@@ -228,8 +270,9 @@ function cmdInit(): void {
   } else {
     process.stdout.write(`init: no templates at ${TEMPLATE_DIR} (add: boardroom add <id>).\n`);
   }
-  // Pre-trust all persona folders so Claude Code sessions launch with zero confirmation screens.
+  // Pre-trust all persona folders (claude + codex) so sessions launch with zero confirmation screens.
   const trusted = pretrustPersonaFolders(listPersonas());
+  pretrustCodexFolders(listPersonas());
   if (trusted) process.stdout.write(`init: pre-trusted ${trusted} persona folder(s) for zero-confirm launch.\n`);
   process.stdout.write(`init: layers ready -> mem/, kb/company/, kb/external/\n`);
 }
@@ -258,7 +301,7 @@ function cmdAdd(args: string[]): void {
   if (runtime === 'claude' || runtime === 'codex') {
     writeFileSync(join(dir, 'runtime'), runtime + '\n', 'utf8');
   }
-  pretrustPersonaFolders([id]);
+  pretrustAll([id]);
   process.stdout.write(`persona '${id}' ready at ${dir} (fill corpus/ with material).\n`);
 }
 
@@ -347,8 +390,8 @@ function cmdConvene(args: string[]): void {
   }
   const ids = args.length ? args : listPersonas();
   if (!ids.length) die('no personas (run: boardroom init, or boardroom add <id>)');
-  // Ensure zero-confirm launch for any claude-backed personas being convened.
-  pretrustPersonaFolders(ids);
+  // Ensure zero-confirm launch for both claude- and codex-backed personas.
+  pretrustAll(ids);
 
   if (!sessionExists()) {
     // Create the session detached with the first persona in window 0.
