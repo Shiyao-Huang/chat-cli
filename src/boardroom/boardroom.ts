@@ -35,6 +35,7 @@ import {
   readFileSync,
   readdirSync,
   statSync,
+  renameSync,
 } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, basename, dirname } from 'node:path';
@@ -245,22 +246,34 @@ You are a live participant in a chat-cli group chat. Your member id is "${id}"; 
 the human principal is "${PRINCIPAL}". Other thinkers are in the room too. It works like a real group chat:
 messages from others are pushed into your terminal as lines beginning with **[群消息] <who>: <what>**.
 
-HOW TO SPEAK — when you have something worth saying, run:
+HOW TO SPEAK — when (and only when) the gate below says you may, run:
     chat send --room ${ROOM} --from ${id} --to <recipients> --type notification "<your message>"
   • Talk to the whole room (everyone sees it):   --to all
   • Reply/challenge ONE member point-to-point:   --to <theirId>      (e.g. --to ${PRINCIPAL}, or --to munger)
   • You can address several:  --to ${PRINCIPAL},munger
   Keep it to <=2 sentences, in character, grounded in YOUR framework (cite ./corpus/ when relevant).
 
-WHEN TO SPEAK — you decide, like a real person in a group chat:
-  • A topic/goal arrives ([BOARDROOM 议题] ...): open with your sharpest framework-specific take, --to all.
-  • A peer message arrives ([群消息] ...): speak ONLY if you have a genuinely NEW, higher-leverage point, or you
-    are directly challenged. If someone @'d you by name, you should respond.
-  • If you'd only be agreeing, repeating, or have nothing new — STAY SILENT. Run no command. Silence is correct;
-    your value is the DISTINCTNESS of your framework, not volume or consensus. Do not reply to every message.
-  • You may run \`chat history --room ${ROOM} --limit 15\` to catch up before deciding.
+## INTENT GATE (硬规则 — 默认沉默)
+The meeting is run by the facilitator **master**. You may run \`chat send\` ONLY if at least ONE of these is true;
+otherwise run NO command (silence is the correct, expected default):
+  (a) FRESH GOAL — a new "[BOARDROOM 议题]" / "议题:" just arrived and you have not yet given your opening take.
+  (b) CALLED — you are @mentioned by id, OR the facilitator "master" called on you by name, OR you are directly
+      challenged by name.
+  (c) NEW, DECISION-CHANGING POINT — you have a point that is (i) genuinely NEW (not a rephrase, agreement, or
+      repeat of something already said), (ii) comes from YOUR distinct framework, and (iii) actually CHANGES A
+      DECISION or FALSIFIES one of the master's convergence criteria. A merely "interesting new angle" is NOT enough.
 
-Stay in character. Be terse. Add a lens or sharpen a disagreement — or say nothing.
+FORBIDDEN (treat as a protocol breach — do NOT do these):
+  • replying just to add "another angle" that doesn't change a decision;
+  • 1:1 @rebuttal ping-pong where you're only defending a point you already made;
+  • speaking to agree, restate, or summarize;
+  • speaking at all after you see a "#system ADJOURN" message — the meeting is over, fall silent (unless @mentioned).
+
+Prefer \`--to all\` for a genuinely new lens; reserve 1:1 \`--to <id>\` for a direct, decision-changing rebuttal.
+When in doubt, STAY SILENT. Your value is the DISTINCTNESS of your framework, not volume or consensus.
+You may run \`chat history --room ${ROOM} --limit 15\` to catch up before deciding.
+
+Stay in character. Be terse. Add a decision-changing lens — or say nothing.
 `;
 }
 
@@ -481,12 +494,37 @@ function windowBusy(id: string): boolean {
   return false;
 }
 
+// Members the supervisor has throttled for dominating the room. Throttled members
+// can still receive/answer DIRECT @mentions, but their un-addressed broadcasts are
+// not fanned out, and room broadcasts are not pushed INTO them — this quiets a
+// dominator without silencing them entirely. (happy-cli's "stop relaying to/from a
+// saturated agent", realized as a filter on the existing relay.)
+function readThrottled(): Set<string> {
+  const path = join(CHAT_HOME, ROOM, 'throttle.json');
+  if (!existsSync(path)) return new Set();
+  try {
+    const arr = JSON.parse(readFileSync(path, 'utf8'));
+    return new Set(Array.isArray(arr) ? arr : []);
+  } catch {
+    return new Set();
+  }
+}
+
 function routeTargets(fromId: string, mentions: string[] | undefined): string[] {
-  const everyone = listPersonas().filter((id) => id !== fromId && windowExists(id));
-  if (!mentions || mentions.length === 0) return everyone; // bare message = broadcast
-  if (mentions.includes('all')) return everyone; // @all = everyone except sender
-  // specific recipients: deliver to named persona windows (skip sender + the human principal)
-  return mentions.filter((m) => m !== fromId && m !== PRINCIPAL && windowExists(m));
+  const throttled = readThrottled();
+  const isBroadcast = !mentions || mentions.length === 0 || mentions.includes('all');
+  // A throttled member's broadcast does not fan out (it can still answer @mentions).
+  if (isBroadcast && throttled.has(fromId)) return [];
+  let targets: string[];
+  if (!mentions || mentions.length === 0 || mentions.includes('all')) {
+    targets = listPersonas().filter((id) => id !== fromId && windowExists(id));
+  } else {
+    targets = mentions.filter((m) => m !== fromId && m !== PRINCIPAL && windowExists(m));
+  }
+  // Don't push un-addressed room broadcasts INTO a throttled member (mute its inbox
+  // for noise, but keep direct @mentions flowing so it stays reachable).
+  if (isBroadcast) targets = targets.filter((t) => !throttled.has(t));
+  return targets;
 }
 
 function relayLine(fromId: string, fromDisplay: string, content: string): string {
@@ -576,6 +614,119 @@ function readHistoryJson(limit: number): HistMsg[] {
   }
 }
 
+// ── supervisor: a deterministic observer (NO LLM, NO adjourn) ──────────────────
+// Ported from happy-cli's supervisorScheduler, trimmed to a pure observer. It does
+// NOT end the meeting — the facilitator "master" owns convergence/ADJOURN. The
+// supervisor only (1) THROTTLES a dominator (relative imbalance) by writing
+// throttle.json that the relay honors, and (2) PAGES master when a member has gone
+// quiet or the room degrades into 1:1 rebuttal ping-pong, so master can act.
+function writeThrottled(ids: string[]): void {
+  ensureRoomCtrlDir();
+  atomicWriteFile(join(CHAT_HOME, ROOM, 'throttle.json'), JSON.stringify(ids));
+}
+function ensureRoomCtrlDir(): void {
+  const d = join(CHAT_HOME, ROOM);
+  if (!existsSync(d)) mkdirSync(d, { recursive: true });
+}
+function atomicWriteFile(path: string, data: string): void {
+  const tmp = `${path}.tmp-${process.pid}`;
+  writeFileSync(tmp, data, 'utf8');
+  renameSync(tmp, path); // atomic on local fs
+}
+
+function cmdSupervise(args: string[]): void {
+  if (!sessionExists()) die('no session — run: boardroom convene (or discuss) first');
+  const intervalMs = Math.max(1000, Number(process.env.SUP_INTERVAL_S || args[0] || '5') * 1000);
+  // A member dominates if it has spoken more than DOMINATE_FACTOR x the median.
+  const DOMINATE_FACTOR = Number(process.env.SUP_DOMINATE_FACTOR || '1.8');
+  const MIN_TO_JUDGE = Number(process.env.SUP_MIN_TO_JUDGE || '8'); // need some volume before throttling
+  const DRIFT_WINDOW = 10;
+  const DRIFT_THRESH = Number(process.env.SUP_DRIFT_THRESH || '0.8');
+  const QUIET_PAGE_S = Number(process.env.SUP_QUIET_PAGE_S || '40'); // page master if a member silent this long while room active
+  process.stdout.write(`supervisor: live (observe + throttle + page master; master owns ADJOURN). Ctrl-C to stop.\n`);
+
+  let lastId = '';
+  const seed = readHistoryJson(1);
+  if (seed.length) lastId = seed[seed.length - 1].id;
+  const speak = new Map<string, { count: number; lastTs: number }>();
+  let lastPagedDrift = 0;
+  const pagedQuiet = new Set<string>();
+  let adjournSeen = false;
+
+  const tick = () => {
+    const all = readHistoryJson(400);
+    const fresh = all.filter((m) => (lastId ? m.id > lastId : true));
+    if (fresh.length) lastId = fresh[fresh.length - 1].id;
+    const now = Date.now();
+
+    for (const m of fresh) {
+      if (m.from === PRINCIPAL || m.from === 'master' || m.from === 'supervisor') {
+        if (m.type === 'system' && /ADJOURN/i.test(m.content)) adjournSeen = true;
+        continue;
+      }
+      const s = speak.get(m.from) || { count: 0, lastTs: 0 };
+      s.count += 1;
+      s.lastTs = Number(m.id.slice(0, 13)) || now;
+      speak.set(m.from, s);
+    }
+    if (adjournSeen) {
+      // Meeting is over (master adjourned). Clear throttles and exit.
+      writeThrottled([]);
+      process.stdout.write('supervisor: master adjourned — exiting.\n');
+      clearInterval(loop);
+      process.exit(0);
+    }
+
+    const counts = [...speak.values()].map((s) => s.count).sort((a, b) => a - b);
+    const total = counts.reduce((a, b) => a + b, 0);
+    if (total >= MIN_TO_JUDGE && counts.length >= 3) {
+      const median = counts[Math.floor(counts.length / 2)] || 1;
+      const dominators: string[] = [];
+      for (const [id, s] of speak) {
+        if (s.count > Math.max(2, DOMINATE_FACTOR * median)) dominators.push(id);
+      }
+      writeThrottled(dominators);
+      // call-on-quiet: a member who has spoken far less and not recently -> page master
+      const recentActive = total > 0;
+      if (recentActive) {
+        for (const id of listPersonas().filter((p) => p !== 'master' && windowExists(p))) {
+          const s = speak.get(id);
+          const silentMs = s ? now - s.lastTs : Infinity;
+          const lowVolume = !s || s.count <= Math.max(1, median - 1);
+          if (lowVolume && silentMs > QUIET_PAGE_S * 1000 && !pagedQuiet.has(id)) {
+            chatCapture(['send', '--room', ROOM, '--from', 'supervisor', '--to', 'master', '--message', `quiet=${id}`]);
+            pagedQuiet.add(id);
+          } else if (s && s.count > median) {
+            pagedQuiet.delete(id); // they've spoken; allow future paging
+          }
+        }
+      }
+    }
+
+    // drift detection: last DRIFT_WINDOW persona msgs that are 1:1 @rebuttals
+    const personaMsgs = all.filter((m) => m.from !== PRINCIPAL && m.from !== 'master' && m.from !== 'supervisor');
+    const lastN = personaMsgs.slice(-DRIFT_WINDOW);
+    if (lastN.length >= DRIFT_WINDOW) {
+      const p2p = lastN.filter((m) => m.mentions && m.mentions.length === 1 && !m.mentions.includes('all')).length;
+      if (p2p / lastN.length >= DRIFT_THRESH && now - lastPagedDrift > 30000) {
+        chatCapture(['send', '--room', ROOM, '--from', 'supervisor', '--to', 'master', '--message', 'drift']);
+        lastPagedDrift = now;
+      }
+    }
+  };
+
+  const loop = setInterval(tick, intervalMs);
+  const stop = () => {
+    clearInterval(loop);
+    writeThrottled([]);
+    process.stdout.write('\nsupervisor: stopped.\n');
+    process.exit(0);
+  };
+  process.on('SIGINT', stop);
+  process.on('SIGTERM', stop);
+}
+
+
 
 function askPrompt(id: string, topic: string): string {
   return (
@@ -604,36 +755,55 @@ function cmdAsk(args: string[]): void {
 // Start a SELF-DRIVING discussion: seed the goal to everyone, then start the relay
 // in its own tmux window so room messages are pushed into agents automatically —
 // one member's reply becomes the next member's input, and the chat self-propagates.
+function startSidecar(name: string, verb: string): void {
+  const win = `${SESSION}:${name}`;
+  const has = tmux(['list-windows', '-t', SESSION, '-F', '#{window_name}']).out
+    .split('\n')
+    .map((s) => s.trim())
+    .includes(name);
+  if (has) return;
+  tmux(['new-window', '-t', SESSION, '-n', name]);
+  const selfBin = process.argv[1];
+  const cmd =
+    `CHAT_HOME=${shq(CHAT_HOME)} BOARD_HOME=${shq(BOARD_HOME)} BOARD_ROOM=${shq(ROOM)} ` +
+    `BOARD_PRINCIPAL=${shq(PRINCIPAL)} exec ${shq(process.execPath)} ${shq(selfBin)} ${verb}`;
+  tmux(['send-keys', '-t', win, cmd, 'C-m']);
+  process.stdout.write(`${name} started (window '${name}').\n`);
+}
+
 function cmdDiscuss(args: string[]): void {
   const goal = args.join(' ').trim();
   if (!goal) die('usage: boardroom discuss "<goal>"');
   if (!sessionExists()) die('no session — run: boardroom convene first');
 
-  // Start the relay in its own window if not already running.
-  const relayWin = `${SESSION}:relay`;
-  const hasRelay = tmux(['list-windows', '-t', SESSION, '-F', '#{window_name}']).out
-    .split('\n')
-    .map((s) => s.trim())
-    .includes('relay');
-  if (!hasRelay) {
-    tmux(['new-window', '-t', SESSION, '-n', 'relay']);
-    const selfBin = process.argv[1];
-    const cmd =
-      `CHAT_HOME=${shq(CHAT_HOME)} BOARD_HOME=${shq(BOARD_HOME)} BOARD_ROOM=${shq(ROOM)} ` +
-      `BOARD_PRINCIPAL=${shq(PRINCIPAL)} exec ${shq(process.execPath)} ${shq(selfBin)} relay`;
-    tmux(['send-keys', '-t', relayWin, cmd, 'C-m']);
-    process.stdout.write(`relay started (window 'relay').\n`);
-  }
+  // Start the transport (relay) and the observer (supervisor) in their own windows.
+  startSidecar('relay', 'relay');
+  startSidecar('supervise', 'supervise');
 
-  // Record + seed the goal to every persona once (their protocol drives the rest).
+  // Hand the goal to the FACILITATOR (master), who runs the meeting: it SEEDs the
+  // agenda with convergence criteria, calls on the quiet, redirects drift, and
+  // declares ADJOURN. If there's no master persona, fall back to broadcasting the
+  // goal to everyone (legacy self-drive).
   chatCapture(['send', '--room', ROOM, '--from', PRINCIPAL, '--message', `议题: ${goal}`]);
-  const seeded: string[] = [];
-  for (const id of listPersonas().filter(windowExists)) {
-    if (injectTopic(id, askPrompt(id, goal))) seeded.push(id);
+  if (windowExists('master')) {
+    injectTopic(
+      'master',
+      `[BOARDROOM 议题] ${PRINCIPAL} 给你的议题：${goal}\n` +
+        `你是主持人 master。请按你的 CLAUDE.md：把它重述成带"收敛判据"的议程，` +
+        `chat send --from master --to all --type system "议题: ... | 收敛判据: (1)... (2)..."，` +
+        `然后主持讨论，judge 够了就 ADJOURN。`,
+    );
+    process.stdout.write(`discussing: ${goal}\n`);
+    process.stdout.write(`handed to facilitator 'master'. The board self-drives; master will converge.\n`);
+  } else {
+    const seeded: string[] = [];
+    for (const id of listPersonas().filter(windowExists)) {
+      if (injectTopic(id, askPrompt(id, goal))) seeded.push(id);
+    }
+    process.stdout.write(`discussing: ${goal}\n`);
+    process.stdout.write(`seeded: ${seeded.join(', ') || '(none live)'} (no master persona — legacy self-drive)\n`);
   }
-  process.stdout.write(`discussing: ${goal}\n`);
-  process.stdout.write(`seeded: ${seeded.join(', ') || '(none live)'}\n`);
-  process.stdout.write(`The board now self-drives. Watch it:  boardroom watch\n`);
+  process.stdout.write(`Watch it:  boardroom watch\n`);
 }
 
 function cmdAskOne(args: string[]): void {
@@ -709,6 +879,7 @@ Run the board (each persona = a live claude/codex in a tmux window; topic via se
   boardroom discuss "<goal>"        Self-driving group chat: seed the goal + start the relay so members
                                     perceive each other's messages and reply on their own (@all / @id routing).
   boardroom relay [intervalS]       (internal) push room messages into agent windows; started by discuss.
+  boardroom supervise [intervalS]   (internal) observe + throttle a dominator + page master; started by discuss.
   boardroom ask "<topic>"           One-shot: send-keys a topic into every live persona (no relay).
   boardroom ask-one <id> "<topic>"  Ask a single thinker.
   boardroom watch                   Slack-style TUI of the room (members + stream + input).
@@ -736,6 +907,7 @@ function main(): void {
     case 'convene': return cmdConvene(args);
     case 'discuss': return cmdDiscuss(args);
     case 'relay': return cmdRelay(args);
+    case 'supervise': return cmdSupervise(args);
     case 'ask': return cmdAsk(args);
     case 'ask-one': return cmdAskOne(args);
     case 'watch': return cmdWatch();
