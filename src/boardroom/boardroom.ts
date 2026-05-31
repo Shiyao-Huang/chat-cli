@@ -307,8 +307,11 @@ function chatCapture(args: string[]): string {
 }
 
 function cmdWatch(): void {
+  // The Slack-style TUI: live members + message stream + an input box so you can
+  // join the discussion yourself. Falls back to a plain tail if not a TTY.
+  const sub = process.stdout.isTTY ? 'tui' : 'watch';
   try {
-    execFileSync('chat', ['watch', '--room', ROOM, '--id', PRINCIPAL], {
+    execFileSync('chat', [sub, '--room', ROOM, '--id', PRINCIPAL], {
       env: { ...process.env, CHAT_HOME },
       stdio: 'inherit',
       shell: process.platform === 'win32',

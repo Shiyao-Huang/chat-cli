@@ -13,6 +13,7 @@
  */
 
 import { ChatBroker } from './core/index.js';
+import { runTui } from './core/tui.js';
 import type {
   ChatMessage,
   MessageType,
@@ -216,6 +217,10 @@ Commands:
   watch    --room R --id ID [--mentions] [--interval S=2]
              Tail forever, printing new messages as they arrive (Ctrl-C to stop).
 
+  tui      --room R --id ID [--interval S=0.7]
+             Slack-style group chat: live members sidebar + message stream + an
+             input box. Type to send; @id mentions a member. Ctrl-C to quit.
+
   roster   --room R [--json]
              List members: id, role, runtime, presence, age since lastSeen.
 
@@ -410,6 +415,13 @@ async function cmdWatch(broker: ChatBroker, p: ParsedArgs): Promise<number> {
   }
 }
 
+async function cmdTui(broker: ChatBroker, p: ParsedArgs): Promise<number> {
+  const room = need(resolveRoom(p), 'room (--room or CHAT_ROOM)');
+  const id = need(resolveId(p), 'id (--id or CHAT_ID)');
+  const intervalMs = Math.max(50, flagNum(p, 0.7, 'interval') * 1000);
+  return runTui(broker, { room, viewerId: id, intervalMs });
+}
+
 function cmdRoster(broker: ChatBroker, p: ParsedArgs): number {
   const room = need(resolveRoom(p), 'room (--room or CHAT_ROOM)');
   const entries: RosterEntry[] = broker.roster(room);
@@ -515,6 +527,8 @@ async function dispatch(argv: string[]): Promise<number> {
     case 'watch':
     case 'tail':
       return cmdWatch(broker, p);
+    case 'tui':
+      return cmdTui(broker, p);
     case 'roster':
     case 'who':
       return cmdRoster(broker, p);
