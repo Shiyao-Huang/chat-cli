@@ -240,15 +240,27 @@ function defaultClaudeMd(id: string, name: string): string {
 
 You are **${name}**. Think in your own distinctive framework. Read ./corpus/ before answering.
 
-## Boardroom protocol
-You are a live participant in a chat-cli boardroom. Your member id is "${id}"; the room is "${ROOM}";
-the principal is "${PRINCIPAL}". When a topic is injected into your terminal:
-  1. Think strictly through YOUR framework.
-  2. Consult ./corpus/ for grounding.
-  3. Reply with ONE highest-leverage point + ONE falsifiable judgment, in character, by running:
-       chat send --room ${ROOM} --from ${id} --to ${PRINCIPAL} --type notification "<your input>"
-  4. To challenge another member: --to ${PRINCIPAL},<otherId>. See others: chat history --room ${ROOM} --limit 15
-Stay in character. Your value is the DISTINCTNESS of your framework, not consensus.
+## Boardroom group chat (你在一个多人 AI 群聊里)
+You are a live participant in a chat-cli group chat. Your member id is "${id}"; the room is "${ROOM}";
+the human principal is "${PRINCIPAL}". Other thinkers are in the room too. It works like a real group chat:
+messages from others are pushed into your terminal as lines beginning with **[群消息] <who>: <what>**.
+
+HOW TO SPEAK — when you have something worth saying, run:
+    chat send --room ${ROOM} --from ${id} --to <recipients> --type notification "<your message>"
+  • Talk to the whole room (everyone sees it):   --to all
+  • Reply/challenge ONE member point-to-point:   --to <theirId>      (e.g. --to ${PRINCIPAL}, or --to munger)
+  • You can address several:  --to ${PRINCIPAL},munger
+  Keep it to <=2 sentences, in character, grounded in YOUR framework (cite ./corpus/ when relevant).
+
+WHEN TO SPEAK — you decide, like a real person in a group chat:
+  • A topic/goal arrives ([BOARDROOM 议题] ...): open with your sharpest framework-specific take, --to all.
+  • A peer message arrives ([群消息] ...): speak ONLY if you have a genuinely NEW, higher-leverage point, or you
+    are directly challenged. If someone @'d you by name, you should respond.
+  • If you'd only be agreeing, repeating, or have nothing new — STAY SILENT. Run no command. Silence is correct;
+    your value is the DISTINCTNESS of your framework, not volume or consensus. Do not reply to every message.
+  • You may run \`chat history --room ${ROOM} --limit 15\` to catch up before deciding.
+
+Stay in character. Be terse. Add a lens or sharpen a disagreement — or say nothing.
 `;
 }
 
@@ -441,11 +453,136 @@ function injectTopic(id: string, text: string): boolean {
   return a.ok && b.ok;
 }
 
+// ── relay: the "real-time inject" transport ───────────────────────────────────
+// A persona's live agent is a passive REPL — it only acts on input. The relay is
+// what makes the room a real group chat: it tails the room and pushes each new
+// message into the right agent window(s) via send-keys, so every member perceives
+// what others said and can choose to reply (or stay silent). This is the piece
+// happy-cli's cloud daemon did via SDK-stream injection; here it's plain tmux.
+//
+// Routing by the message's mentions (set by `chat send --to ...`):
+//   • mentions includes "all"  -> everyone except the sender (broadcast page)
+//   • mentions has specific ids -> only those windows (point-to-point)
+//   • no mentions (bare message) -> everyone except the sender (room broadcast)
+// The principal ("you") is never injected (they read via the TUI), but messages
+// addressed to a persona by the principal are delivered normally.
+
+const BUSY_TAIL_RE = /(esc to interrupt|Thinking|Churn|Quantum|Working|running|tokens|⏵⏵.*on)/i;
+
+// Heuristic: is the agent in this window mid-turn (so injecting now would corrupt input)?
+function windowBusy(id: string): boolean {
+  const { ok, out } = tmux(['capture-pane', '-t', windowFor(id), '-p']);
+  if (!ok) return false;
+  const lines = out.split('\n').filter((l) => l.trim() !== '');
+  const tail = lines.slice(-4).join(' ');
+  // "esc to interrupt" / a running spinner means the agent is actively working.
+  // A bare prompt (❯ / ›) with no spinner means idle and safe to inject.
+  if (/esc to interrupt|to interrupt/i.test(tail)) return true;
+  return false;
+}
+
+function routeTargets(fromId: string, mentions: string[] | undefined): string[] {
+  const everyone = listPersonas().filter((id) => id !== fromId && windowExists(id));
+  if (!mentions || mentions.length === 0) return everyone; // bare message = broadcast
+  if (mentions.includes('all')) return everyone; // @all = everyone except sender
+  // specific recipients: deliver to named persona windows (skip sender + the human principal)
+  return mentions.filter((m) => m !== fromId && m !== PRINCIPAL && windowExists(m));
+}
+
+function relayLine(fromId: string, fromDisplay: string, content: string): string {
+  // What the recipient agent sees injected into its window. Their persona protocol
+  // tells them to read it and decide whether to chat send a reply (or stay silent).
+  return `[群消息] ${fromDisplay || fromId}: ${content}`;
+}
+
+interface RelayState {
+  lastId: string;
+  // messages waiting because their target window was busy: targetId -> queued lines
+  pending: Map<string, string[]>;
+}
+
+function cmdRelay(args: string[]): void {
+  if (!sessionExists()) die('no session — run: boardroom convene (or discuss) first');
+  const intervalMs = Math.max(300, Number(args[0] || '1') * 1000) || 1000;
+  process.stdout.write(`relay: live. Pushing room messages into agent windows (Ctrl-C to stop).\n`);
+  const state: RelayState = { lastId: '', pending: new Map() };
+
+  // Seed lastId to "now" so the relay only forwards messages from this point on
+  // (history already sits in each agent's context if they were just convened).
+  const seed = readHistoryJson(1);
+  if (seed.length) state.lastId = seed[seed.length - 1].id;
+
+  const tick = () => {
+    // 1) flush any queued messages whose target window is now idle.
+    for (const [target, lines] of state.pending) {
+      if (!lines.length) {
+        state.pending.delete(target);
+        continue;
+      }
+      if (!windowBusy(target)) {
+        const line = lines.shift()!;
+        injectTopic(target, line);
+        if (!lines.length) state.pending.delete(target);
+      }
+    }
+    // 2) pull new messages and route them.
+    const msgs = readHistoryJson(200).filter((m) => (state.lastId ? m.id > state.lastId : true));
+    for (const m of msgs) {
+      state.lastId = m.id;
+      if (m.from === PRINCIPAL && (!m.mentions || m.mentions.length === 0)) {
+        // a bare message from the principal is a topic for everyone (handled by discuss/ask)
+      }
+      const targets = routeTargets(m.from, m.mentions);
+      const line = relayLine(m.from, m.fromDisplayName || m.from, m.content);
+      for (const t of targets) {
+        if (windowBusy(t)) {
+          const q = state.pending.get(t) || [];
+          q.push(line);
+          state.pending.set(t, q);
+        } else {
+          injectTopic(t, line);
+        }
+      }
+    }
+  };
+
+  // Run forever until Ctrl-C.
+  const loop = setInterval(tick, intervalMs);
+  const stop = () => {
+    clearInterval(loop);
+    process.stdout.write('\nrelay: stopped.\n');
+    process.exit(0);
+  };
+  process.on('SIGINT', stop);
+  process.on('SIGTERM', stop);
+}
+
+interface HistMsg {
+  id: string;
+  from: string;
+  fromDisplayName?: string;
+  content: string;
+  mentions?: string[];
+  type?: string;
+}
+
+function readHistoryJson(limit: number): HistMsg[] {
+  const raw = chatCapture(['history', '--room', ROOM, '--limit', String(limit), '--json']);
+  try {
+    const arr = JSON.parse(raw);
+    return Array.isArray(arr) ? (arr as HistMsg[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+
 function askPrompt(id: string, topic: string): string {
   return (
     `[BOARDROOM 议题] ${topic} ` +
     `（只用你自己的框架，参考 ./corpus/，给一条最高杠杆输入 + 一个可证伪判断，` +
-    `然后运行：chat send --room ${ROOM} --from ${id} --to ${PRINCIPAL} --type notification "..."）`
+    `然后运行：chat send --room ${ROOM} --from ${id} --to all --type notification "..."。` +
+    `之后群里别人发言会推给你，有新观点再说，没有就沉默。）`
   );
 }
 
@@ -462,6 +599,41 @@ function cmdAsk(args: string[]): void {
   }
   process.stdout.write(`asked: ${asked.join(', ') || '(none live)'}\n`);
   process.stdout.write(`Watch replies:  boardroom watch\n`);
+}
+
+// Start a SELF-DRIVING discussion: seed the goal to everyone, then start the relay
+// in its own tmux window so room messages are pushed into agents automatically —
+// one member's reply becomes the next member's input, and the chat self-propagates.
+function cmdDiscuss(args: string[]): void {
+  const goal = args.join(' ').trim();
+  if (!goal) die('usage: boardroom discuss "<goal>"');
+  if (!sessionExists()) die('no session — run: boardroom convene first');
+
+  // Start the relay in its own window if not already running.
+  const relayWin = `${SESSION}:relay`;
+  const hasRelay = tmux(['list-windows', '-t', SESSION, '-F', '#{window_name}']).out
+    .split('\n')
+    .map((s) => s.trim())
+    .includes('relay');
+  if (!hasRelay) {
+    tmux(['new-window', '-t', SESSION, '-n', 'relay']);
+    const selfBin = process.argv[1];
+    const cmd =
+      `CHAT_HOME=${shq(CHAT_HOME)} BOARD_HOME=${shq(BOARD_HOME)} BOARD_ROOM=${shq(ROOM)} ` +
+      `BOARD_PRINCIPAL=${shq(PRINCIPAL)} exec ${shq(process.execPath)} ${shq(selfBin)} relay`;
+    tmux(['send-keys', '-t', relayWin, cmd, 'C-m']);
+    process.stdout.write(`relay started (window 'relay').\n`);
+  }
+
+  // Record + seed the goal to every persona once (their protocol drives the rest).
+  chatCapture(['send', '--room', ROOM, '--from', PRINCIPAL, '--message', `议题: ${goal}`]);
+  const seeded: string[] = [];
+  for (const id of listPersonas().filter(windowExists)) {
+    if (injectTopic(id, askPrompt(id, goal))) seeded.push(id);
+  }
+  process.stdout.write(`discussing: ${goal}\n`);
+  process.stdout.write(`seeded: ${seeded.join(', ') || '(none live)'}\n`);
+  process.stdout.write(`The board now self-drives. Watch it:  boardroom watch\n`);
 }
 
 function cmdAskOne(args: string[]): void {
@@ -534,9 +706,12 @@ Your layers (also folders):
 
 Run the board (each persona = a live claude/codex in a tmux window; topic via send-keys):
   boardroom convene [ids...]        Open one live persona window per id (default: all). Zero confirmation screens.
-  boardroom ask "<topic>"           send-keys a topic into every live persona; they reply into the room.
+  boardroom discuss "<goal>"        Self-driving group chat: seed the goal + start the relay so members
+                                    perceive each other's messages and reply on their own (@all / @id routing).
+  boardroom relay [intervalS]       (internal) push room messages into agent windows; started by discuss.
+  boardroom ask "<topic>"           One-shot: send-keys a topic into every live persona (no relay).
   boardroom ask-one <id> "<topic>"  Ask a single thinker.
-  boardroom watch                   Tail the boardroom room live.
+  boardroom watch                   Slack-style TUI of the room (members + stream + input).
   boardroom minutes [N]             Print the last N messages as meeting minutes.
   boardroom digest                  Append the current minutes into YOUR memory (mem/).
   boardroom attach                  Attach to the tmux session (Ctrl-b d to detach).
@@ -559,6 +734,8 @@ function main(): void {
     case 'remember': return cmdRemember(args);
     case 'doc': return cmdDoc(args);
     case 'convene': return cmdConvene(args);
+    case 'discuss': return cmdDiscuss(args);
+    case 'relay': return cmdRelay(args);
     case 'ask': return cmdAsk(args);
     case 'ask-one': return cmdAskOne(args);
     case 'watch': return cmdWatch();
